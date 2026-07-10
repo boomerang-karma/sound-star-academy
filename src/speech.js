@@ -120,7 +120,10 @@ function pentity(x) {
      { status:'nomatch' }                    — heard nothing usable
    Rejects on real errors (network, token, mic).
    ===================================================================== */
-export function assessPronunciation(referenceText, worldId) {
+export function assessPronunciation(referenceText, worldId, opts = {}) {
+  // Kids need time: long window to *start* speaking, and generous
+  // pause tolerance so mid-sentence breaths don't cut recognition short.
+  const endMs = String(opts.endSilenceMs ?? 1600);
   return new Promise(async (resolve, reject) => {
     let recognizer = null;
     try {
@@ -129,15 +132,22 @@ export function assessPronunciation(referenceText, worldId) {
 
       const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
       speechConfig.speechRecognitionLanguage = "en-US";
-      // Give a young speaker a moment to start, then end quickly on silence.
+      // Up to 20s to start talking — thinking time is allowed!
       speechConfig.setProperty(
         sdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
-        "6000"
+        "20000"
       );
+      // How long a pause can be before we decide the kid is done.
       speechConfig.setProperty(
         sdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-        "900"
+        endMs
       );
+      try {
+        speechConfig.setProperty(
+          sdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+          endMs
+        );
+      } catch (e) {}
 
       const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
 

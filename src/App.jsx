@@ -374,7 +374,9 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
     setPhase("listening");
     let v;
     try {
-      const res = await assessPronunciation(item.text, world.id);
+      const res = await assessPronunciation(item.text, world.id, {
+        endSilenceMs: kind === "words" ? 1100 : 1900,
+      });
       if (res.status === "ok") {
         v = { kind: "ok", ...res, stars: starsFor(res.target) };
         onRobotScore(res.target);
@@ -474,7 +476,7 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
             Robot Ears is listening…
           </div>
           <div className="font-bold text-base" style={{ color: INK, opacity: 0.7 }}>
-            Say it loud and clear!
+            Take a breath — say it when you're ready!
           </div>
         </Pane>
       )}
