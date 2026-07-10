@@ -621,35 +621,39 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
   );
 }
 
-/* ---------------- mic enable banner ---------------- */
-function MicBanner({ checking, onEnable, onSkip }) {
+/* ---------------- mic wake-up (permission is requested automatically) ---------------- */
+function MicWakeup({ onSkip }) {
   return (
     <Pane className="p-5 text-center mb-4">
-      <div className="text-5xl mb-2">🎙️</div>
-      <div className="font-display font-extrabold text-lg mb-1" style={{ color: INK }}>
-        Turn on Robot Ears?
+      <div className="text-5xl pulse inline-block">👂</div>
+      <div className="font-display font-extrabold text-lg mb-1 mt-2" style={{ color: INK }}>
+        Getting Robot Ears ready…
       </div>
       <div className="font-bold text-sm mb-4" style={{ color: INK, opacity: 0.7 }}>
-        The robot can listen and score your sounds. Ask a grown-up to tap Allow!
+        If your browser asks about the microphone, tap Allow!
       </div>
-      <div className="grid grid-cols-1 gap-3">
-        <Btn color="#3FB6F0" className="py-4 text-lg" onClick={onEnable} disabled={checking}>
-          {checking ? "Checking the mic… 👂" : "🎙️ Turn on my mic"}
-        </Btn>
-        <Btn className="py-3 text-base" onClick={onSkip}>
-          Skip — I'll judge myself
-        </Btn>
-      </div>
+      <Btn className="py-3 px-5 text-base" onClick={onSkip}>
+        Skip — I'll judge myself
+      </Btn>
     </Pane>
   );
 }
 
 /* ---------------- Play wrapper ---------------- */
-function Play({ world, li, mode, checking, onEnableMic, onExit, onComplete, onRobotScore }) {
+function Play({ world, li, mode, checking, micDenied, onEnableMic, onExit, onComplete, onRobotScore }) {
   const level = LEVELS[li];
   const [skipMic, setSkipMic] = useState(false);
   const isSayLevel = ["words", "sentences", "story"].includes(level.key);
   const input = skipMic ? "self" : mode;
+
+  /* Ask for the mic automatically the first time a speaking level opens */
+  const asked = useRef(false);
+  useEffect(() => {
+    if (isSayLevel && input === "unknown" && !checking && !asked.current) {
+      asked.current = true;
+      onEnableMic();
+    }
+  }, [isSayLevel, input, checking]);
 
   const wordDeck = useMemo(() => {
     if (level.key !== "words") return null;
@@ -663,7 +667,7 @@ function Play({ world, li, mode, checking, onEnableMic, onExit, onComplete, onRo
     if (level.key === "listen") return <ListenGame world={world} onDone={onComplete} />;
     if (level.key === "lab") return <LabGame world={world} onDone={onComplete} />;
     if (isSayLevel && input === "unknown")
-      return <MicBanner checking={checking} onEnable={onEnableMic} onSkip={() => setSkipMic(true)} />;
+      return <MicWakeup onSkip={() => setSkipMic(true)} />;
     if (level.key === "words") return <SayDeck items={wordDeck} kind="words" {...deckProps} />;
     if (level.key === "sentences")
       return <SayDeck items={world.sentences.map((s) => ({ text: s }))} kind="sentences" {...deckProps} />;
@@ -696,6 +700,16 @@ function Play({ world, li, mode, checking, onEnableMic, onExit, onComplete, onRo
           <span className="font-bold text-sm" style={{ color: INK }}>
             🔇 This browser can't talk — read the words out loud together!
           </span>
+        </Pane>
+      )}
+      {isSayLevel && micDenied && !skipMic && (
+        <Pane className="p-3 mb-4 text-center" color="#FFF1D6">
+          <div className="font-bold text-sm mb-2" style={{ color: INK }}>
+            🎤 Robot Ears couldn't use the microphone — using self-check for now.
+          </div>
+          <Btn className="px-5 py-2 text-sm" onClick={onEnableMic} disabled={checking}>
+            {checking ? "Trying… 👂" : "🔁 Try the mic again"}
+          </Btn>
         </Pane>
       )}
       {body}
@@ -1188,6 +1202,7 @@ export default function App() {
             li={view.li}
             mode={mode}
             checking={checking}
+            micDenied={progress.settings.robotEars && caps !== null && !caps.mic}
             onEnableMic={requestCaps}
             onExit={() => go({ name: "world", w: view.w })}
             onComplete={(payload) => complete(view.w, view.li, payload)}
