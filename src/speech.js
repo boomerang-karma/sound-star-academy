@@ -114,91 +114,138 @@ function pentity(x) {
 }
 
 /* =====================================================================
-   Azure Pronunciation Assessment (scripted mode)
-   Listens on the mic, compares against `referenceText`, resolves with:
+   Azure Pronunciation Assessment — persistent session
+
+   createAssessmentSession() is called ONCE when a speaking level opens.
+   It builds the recognizer, pre-opens the websocket to Azure, and stays
+   armed in a "ready to hear" state. Each word then scores instantly with
+   no connection wait.
+
+   Audio input uses the SDK's own microphone path (fromDefaultMicrophoneInput),
+   which is the reliable one — do NOT hand it a MediaStream we opened
+   ourselves; that path silently delivers no audio.
+
+   session.assess(text) resolves with:
      { status:'ok', overall, target, heard }
-     { status:'nomatch' }                    — heard nothing usable
-   Rejects on real errors (network, token, mic).
+     { status:'nomatch' }   — nothing usable was heard
    ===================================================================== */
-export function assessPronunciation(referenceText, worldId, opts = {}) {
-  // Kids need time: long window to *start* speaking, and generous
-  // pause tolerance so mid-sentence breaths don't cut recognition short.
+export async function createAssessmentSession(worldId, opts = {}) {
+  const sdk = await getSdk();
+  const { token, region } = await getToken();
   const endMs = String(opts.endSilenceMs ?? 1600);
-  return new Promise(async (resolve, reject) => {
-    let recognizer = null;
+
+  const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
+  speechConfig.speechRecognitionLanguage = "en-US";
+  // Up to 20s to START talking — thinking time is allowed.
+  speechConfig.setProperty(
+    sdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+    "20000"
+  );
+  // How long a pause can be before we decide the kid is finished.
+  speechConfig.setProperty(
+    sdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+    endMs
+  );
+  try {
+    speechConfig.setProperty(sdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, endMs);
+  } catch (e) {}
+
+  const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
+  const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+
+  /* ---- ready state ---- */
+  let ready = false;
+  let closed = false;
+  const markReady = () => {
+    if (ready || closed) return;
+    ready = true;
     try {
-      const sdk = await getSdk();
-      const { token, region } = await getToken();
+      if (opts.onReady) opts.onReady();
+    } catch (e) {}
+  };
 
-      const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
-      speechConfig.speechRecognitionLanguage = "en-US";
-      // Up to 20s to start talking — thinking time is allowed!
-      speechConfig.setProperty(
-        sdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
-        "20000"
-      );
-      // How long a pause can be before we decide the kid is done.
-      speechConfig.setProperty(
-        sdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-        endMs
-      );
-      try {
-        speechConfig.setProperty(
-          sdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-          endMs
-        );
-      } catch (e) {}
+  // Pre-open the websocket so the first word doesn't pay the handshake cost.
+  let connection = null;
+  try {
+    connection = sdk.Connection.fromRecognizer(recognizer);
+    connection.connected = () => markReady();
+    connection.openConnection();
+  } catch (e) {}
 
-      const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
+  recognizer.sessionStarted = () => markReady();
 
-      const paConfig = new sdk.PronunciationAssessmentConfig(
-        referenceText,
-        sdk.PronunciationAssessmentGradingSystem.HundredMark,
-        sdk.PronunciationAssessmentGranularity.Phoneme,
-        false
-      );
-      paConfig.phonemeAlphabet = "IPA";
+  // Safety net: never leave the UI stuck on "connecting" forever.
+  const readyTimer = setTimeout(markReady, 2000);
 
-      recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
-      paConfig.applyTo(recognizer);
+  // Partial hypotheses = proof Azure is actually picking up the voice.
+  recognizer.recognizing = (s, e) => {
+    try {
+      if (opts.onHearing && e && e.result && e.result.text) opts.onHearing(e.result.text);
+    } catch (er) {}
+  };
 
-      recognizer.recognizeOnceAsync(
-        (result) => {
-          try {
-            if (result.reason === sdk.ResultReason.RecognizedSpeech) {
-              const pa = sdk.PronunciationAssessmentResult.fromResult(result);
-              let detail = null;
-              try {
-                detail = JSON.parse(
-                  result.properties.getProperty(
-                    sdk.PropertyId.SpeechServiceResponse_JsonResult
-                  )
-                );
-              } catch (e) {}
-              const overall = Math.round(pa?.accuracyScore ?? 0);
-              const target = extractTargetScore(detail, worldId) ?? overall;
-              resolve({ status: "ok", overall, target, heard: result.text || "" });
-            } else {
-              resolve({ status: "nomatch" });
-            }
-          } finally {
-            recognizer.close();
-          }
-        },
-        (err) => {
-          try {
-            recognizer.close();
-          } catch (e) {}
-          reject(new Error(err || "recognition-failed"));
+  return {
+    isReady: () => ready,
+
+    assess(referenceText) {
+      return new Promise((resolve, reject) => {
+        if (closed) {
+          reject(new Error("session-closed"));
+          return;
         }
-      );
-    } catch (e) {
+        try {
+          const paConfig = new sdk.PronunciationAssessmentConfig(
+            referenceText,
+            sdk.PronunciationAssessmentGradingSystem.HundredMark,
+            sdk.PronunciationAssessmentGranularity.Phoneme,
+            false
+          );
+          paConfig.phonemeAlphabet = "IPA";
+          paConfig.applyTo(recognizer);
+
+          recognizer.recognizeOnceAsync(
+            (result) => {
+              try {
+                if (result.reason === sdk.ResultReason.RecognizedSpeech) {
+                  const pa = sdk.PronunciationAssessmentResult.fromResult(result);
+                  let detail = null;
+                  try {
+                    detail = JSON.parse(
+                      result.properties.getProperty(
+                        sdk.PropertyId.SpeechServiceResponse_JsonResult
+                      )
+                    );
+                  } catch (e) {}
+                  const overall = Math.round((pa && pa.accuracyScore) || 0);
+                  const target = extractTargetScore(detail, worldId) ?? overall;
+                  resolve({ status: "ok", overall, target, heard: result.text || "" });
+                } else {
+                  resolve({ status: "nomatch" });
+                }
+              } catch (e) {
+                reject(e);
+              }
+            },
+            (err) => reject(new Error(err || "recognition-failed"))
+          );
+        } catch (e) {
+          reject(e);
+        }
+      });
+    },
+
+    close() {
+      if (closed) return;
+      closed = true;
+      clearTimeout(readyTimer);
       try {
-        if (recognizer) recognizer.close();
-      } catch (e2) {}
-      reject(e);
-    }
-  });
+        if (connection) connection.closeConnection();
+      } catch (e) {}
+      try {
+        recognizer.close();
+      } catch (e) {}
+    },
+  };
 }
 
 /* =====================================================================

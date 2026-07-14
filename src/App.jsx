@@ -5,7 +5,7 @@ import {
   hush,
   canSpeak,
   detectCapabilities,
-  assessPronunciation,
+  createAssessmentSession,
   recordClip,
   playBlob,
 } from "./speech.js";
@@ -334,9 +334,11 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
   const [countdown, setCountdown] = useState(null);
   const [clip, setClip] = useState(null);
   const [burst, setBurst] = useState(0);
-  const [micLive, setMicLive] = useState(false);
-  const [level, setLevel] = useState(0);
+  const [ready, setReady] = useState(false);
+  const [hearing, setHearing] = useState(false);
+  const [sessionDead, setSessionDead] = useState(false);
   const recRef = useRef(null);
+  const sessRef = useRef(null);
 
   const item = items[i];
   const ttsRate = kind === "words" ? 0.78 : 0.72;
@@ -358,6 +360,49 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
     []
   );
 
+  /* Arm Robot Ears ONCE for the whole level and keep it in a ready state,
+     so each word starts instantly instead of reconnecting every time. */
+  useEffect(() => {
+    if (input !== "azure") return undefined;
+    let dead = false;
+    setReady(false);
+    setSessionDead(false);
+    onMicStatus("connecting");
+
+    createAssessmentSession(world.id, {
+      endSilenceMs: kind === "words" ? 1100 : 1900,
+      onReady: () => {
+        if (dead) return;
+        setReady(true);
+        onMicStatus("ready");
+      },
+      onHearing: () => {
+        if (!dead) setHearing(true);
+      },
+    })
+      .then((sess) => {
+        if (dead) {
+          sess.close();
+          return;
+        }
+        sessRef.current = sess;
+      })
+      .catch(() => {
+        if (dead) return;
+        setSessionDead(true);
+        onMicStatus("idle");
+      });
+
+    return () => {
+      dead = true;
+      if (sessRef.current) {
+        sessRef.current.close();
+        sessRef.current = null;
+      }
+      onMicStatus("idle");
+    };
+  }, [input, world.id, kind]);
+
   const advance = () => {
     setBurst((b) => b + 1);
     setTimeout(() => {
@@ -373,21 +418,15 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
 
   /* ---- Azure Robot Ears ---- */
   const startAzure = async () => {
+    const sess = sessRef.current;
+    if (!sess) return; // not armed yet — button is disabled anyway
     hush();
-    setMicLive(false);
-    setLevel(0);
+    setHearing(false);
     setPhase("listening");
-    onMicStatus("connecting");
+    onMicStatus("listening");
     let v;
     try {
-      const res = await assessPronunciation(item.text, world.id, {
-        endSilenceMs: kind === "words" ? 1100 : 1900,
-        onReady: () => {
-          setMicLive(true);
-          onMicStatus("listening");
-        },
-        onLevel: (n) => setLevel(n),
-      });
+      const res = await sess.assess(item.text);
       if (res.status === "ok") {
         v = { kind: "ok", ...res, stars: starsFor(res.target) };
         onRobotScore(res.target);
@@ -397,7 +436,7 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
     } catch (e) {
       v = { kind: "error" };
     }
-    onMicStatus("idle");
+    onMicStatus(sessRef.current ? "ready" : "idle");
     setTries((t) => t + 1);
     setVerdict(v);
     setPhase("verdict");
@@ -424,8 +463,8 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
     onMicStatus("idle");
   };
 
-  const micLabel = input === "azure" ? "🎤 Robot Ears!" : "🎤 Record me!";
-  const micAction = input === "azure" ? startAzure : startRecord;
+  // If Robot Ears can't arm at all, quietly fall back to self-checking.
+  const selfMode = input === "self" || sessionDead;
 
   return (
     <div className="relative">
@@ -449,18 +488,38 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
 
       {/* ---------- SAY ---------- */}
       {phase === "say" && (
-        <div className="grid grid-cols-2 gap-3">
-          <Btn className="py-4 text-lg" onClick={() => speak(item.text, ttsRate)}>
-            🔊 Hear it
-          </Btn>
-          {input === "self" ? (
-            <Btn color={world.color} className="py-4 text-lg" onClick={() => setPhase("rate")}>
-              🗣️ I said it!
+        <div>
+          <div className="grid grid-cols-2 gap-3">
+            <Btn className="py-4 text-lg" onClick={() => speak(item.text, ttsRate)}>
+              🔊 Hear it
             </Btn>
-          ) : (
-            <Btn color={world.color} className="py-4 text-lg" onClick={micAction}>
-              {micLabel}
-            </Btn>
+            {selfMode ? (
+              <Btn color={world.color} className="py-4 text-lg" onClick={() => setPhase("rate")}>
+                🗣️ I said it!
+              </Btn>
+            ) : input === "azure" ? (
+              <Btn
+                color={ready ? world.color : "#E9E4D8"}
+                className="py-4 text-lg"
+                style={{ opacity: ready ? 1 : 0.6 }}
+                onClick={() => ready && startAzure()}
+                disabled={!ready}
+              >
+                {ready ? "🎤 Robot Ears!" : "⏳ Waking up…"}
+              </Btn>
+            ) : (
+              <Btn color={world.color} className="py-4 text-lg" onClick={startRecord}>
+                🎤 Record me!
+              </Btn>
+            )}
+          </div>
+          {input === "azure" && !selfMode && (
+            <div
+              className="font-bold text-sm mt-3 text-center"
+              style={{ color: ready ? "#1B9E55" : INK, opacity: ready ? 1 : 0.6 }}
+            >
+              {ready ? "🟢 Robot Ears is ready to hear you!" : "Robot Ears is waking up…"}
+            </div>
           )}
         </div>
       )}
@@ -485,32 +544,16 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
       {/* ---------- AZURE: LISTENING ---------- */}
       {phase === "listening" && (
         <Pane className="p-6 text-center" color={PAPER}>
-          <div className={`text-6xl inline-block ${micLive ? "pulse" : ""}`}>
-            {micLive ? "🎤" : "⏳"}
-          </div>
+          <div className="text-6xl pulse inline-block">{hearing ? "🗣️" : "🎤"}</div>
           <div
             className="font-display font-extrabold text-xl mt-2"
-            style={{ color: micLive ? "#1B9E55" : INK }}
+            style={{ color: "#1B9E55" }}
           >
-            {micLive ? "🟢 Say it now!" : "Getting ready…"}
+            {hearing ? "I hear you!" : "🟢 Say it now!"}
           </div>
           <div className="font-bold text-base" style={{ color: INK, opacity: 0.7 }}>
-            {micLive ? "Take your time — the robot is listening." : "Wait for the green light!"}
+            {hearing ? "Keep going…" : "Take your time — the robot is listening."}
           </div>
-          {micLive && (
-            <div className="flex justify-center gap-1 mt-4">
-              {[0, 1, 2, 3, 4].map((k) => (
-                <span
-                  key={k}
-                  className="w-3 h-7 rounded-full border-2"
-                  style={{
-                    borderColor: INK,
-                    background: level > (k + 0.6) / 5 ? "#37C978" : "#FFFFFF",
-                  }}
-                />
-              ))}
-            </div>
-          )}
         </Pane>
       )}
 
@@ -677,7 +720,8 @@ function MicWakeup({ onSkip }) {
 /* ---------------- persistent mic status bar ---------------- */
 const MIC_STATUS = {
   idle: { dot: "#9CA3AF", label: "Mic idle", pulse: false, icon: "🎤" },
-  connecting: { dot: "#FFC53D", label: "Connecting…", pulse: true, icon: "⏳" },
+  connecting: { dot: "#FFC53D", label: "Waking up mic…", pulse: true, icon: "⏳" },
+  ready: { dot: "#37C978", label: "Ready to hear you", pulse: false, icon: "🎤" },
   listening: { dot: "#37C978", label: "Listening…", pulse: true, icon: "🎤" },
   recording: { dot: "#FF5D73", label: "Recording…", pulse: true, icon: "🎤" },
 };
@@ -1314,4 +1358,3 @@ export default function App() {
     </div>
   );
 }
-
