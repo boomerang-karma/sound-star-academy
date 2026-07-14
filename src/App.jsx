@@ -326,7 +326,7 @@ const POS_CHIP = {
 const starsFor = (t) => (t >= 80 ? 3 : t >= 60 ? 2 : 1);
 const starRow = (n) => "⭐".repeat(n);
 
-function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
+function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus = () => {} }) {
   const [i, setI] = useState(0);
   const [phase, setPhase] = useState("say"); // say|rate|listening|verdict|recording|compare
   const [verdict, setVerdict] = useState(null);
@@ -334,6 +334,8 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
   const [countdown, setCountdown] = useState(null);
   const [clip, setClip] = useState(null);
   const [burst, setBurst] = useState(0);
+  const [micLive, setMicLive] = useState(false);
+  const [level, setLevel] = useState(0);
   const recRef = useRef(null);
 
   const item = items[i];
@@ -351,6 +353,7 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
   useEffect(
     () => () => {
       if (recRef.current) recRef.current.stop();
+      onMicStatus("idle");
     },
     []
   );
@@ -371,11 +374,19 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
   /* ---- Azure Robot Ears ---- */
   const startAzure = async () => {
     hush();
+    setMicLive(false);
+    setLevel(0);
     setPhase("listening");
+    onMicStatus("connecting");
     let v;
     try {
       const res = await assessPronunciation(item.text, world.id, {
         endSilenceMs: kind === "words" ? 1100 : 1900,
+        onReady: () => {
+          setMicLive(true);
+          onMicStatus("listening");
+        },
+        onLevel: (n) => setLevel(n),
       });
       if (res.status === "ok") {
         v = { kind: "ok", ...res, stars: starsFor(res.target) };
@@ -386,6 +397,7 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
     } catch (e) {
       v = { kind: "error" };
     }
+    onMicStatus("idle");
     setTries((t) => t + 1);
     setVerdict(v);
     setPhase("verdict");
@@ -395,6 +407,7 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
   const startRecord = async () => {
     hush();
     setPhase("recording");
+    onMicStatus("recording");
     try {
       const ms = kind === "words" ? 3500 : 6000;
       const r = await recordClip(ms, (s) => setCountdown(s));
@@ -408,6 +421,7 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
       setCountdown(null);
       setPhase("say");
     }
+    onMicStatus("idle");
   };
 
   const micLabel = input === "azure" ? "🎤 Robot Ears!" : "🎤 Record me!";
@@ -471,13 +485,32 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore }) {
       {/* ---------- AZURE: LISTENING ---------- */}
       {phase === "listening" && (
         <Pane className="p-6 text-center" color={PAPER}>
-          <div className="text-6xl pulse inline-block">🎤</div>
-          <div className="font-display font-extrabold text-lg mt-2" style={{ color: INK }}>
-            Robot Ears is listening…
+          <div className={`text-6xl inline-block ${micLive ? "pulse" : ""}`}>
+            {micLive ? "🎤" : "⏳"}
+          </div>
+          <div
+            className="font-display font-extrabold text-xl mt-2"
+            style={{ color: micLive ? "#1B9E55" : INK }}
+          >
+            {micLive ? "🟢 Say it now!" : "Getting ready…"}
           </div>
           <div className="font-bold text-base" style={{ color: INK, opacity: 0.7 }}>
-            Take a breath — say it when you're ready!
+            {micLive ? "Take your time — the robot is listening." : "Wait for the green light!"}
           </div>
+          {micLive && (
+            <div className="flex justify-center gap-1 mt-4">
+              {[0, 1, 2, 3, 4].map((k) => (
+                <span
+                  key={k}
+                  className="w-3 h-7 rounded-full border-2"
+                  style={{
+                    borderColor: INK,
+                    background: level > (k + 0.6) / 5 ? "#37C978" : "#FFFFFF",
+                  }}
+                />
+              ))}
+            </div>
+          )}
         </Pane>
       )}
 
@@ -641,8 +674,36 @@ function MicWakeup({ onSkip }) {
   );
 }
 
+/* ---------------- persistent mic status bar ---------------- */
+const MIC_STATUS = {
+  idle: { dot: "#9CA3AF", label: "Mic idle", pulse: false, icon: "🎤" },
+  connecting: { dot: "#FFC53D", label: "Connecting…", pulse: true, icon: "⏳" },
+  listening: { dot: "#37C978", label: "Listening…", pulse: true, icon: "🎤" },
+  recording: { dot: "#FF5D73", label: "Recording…", pulse: true, icon: "🎤" },
+};
+
+function MicStatusBar({ status }) {
+  const c = MIC_STATUS[status] || MIC_STATUS.idle;
+  return (
+    <div className="fixed bottom-0 inset-x-0 z-40 flex justify-center pointer-events-none pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+      <div
+        className="stk-sm flex items-center gap-2 px-4 py-2 font-display font-bold text-sm"
+        style={{ background: "#FFFFFF", color: INK }}
+      >
+        <span
+          className={`w-2.5 h-2.5 rounded-full ${c.pulse ? "pulse" : ""}`}
+          style={{ background: c.dot }}
+        />
+        {c.icon} {c.label}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------- Play wrapper ---------------- */
-function Play({ world, li, mode, checking, micDenied, onEnableMic, onExit, onComplete, onRobotScore }) {
+
+
+function Play({ world, li, mode, checking, micDenied, onEnableMic, onExit, onComplete, onRobotScore, onMicStatus }) {
   const level = LEVELS[li];
   const [skipMic, setSkipMic] = useState(false);
   const isSayLevel = ["words", "sentences", "story"].includes(level.key);
@@ -663,7 +724,7 @@ function Play({ world, li, mode, checking, micDenied, onEnableMic, onExit, onCom
     return [...mk(world.words.start, "start"), ...mk(world.words.middle, "middle"), ...mk(world.words.end, "end")];
   }, [world.id, li]);
 
-  const deckProps = { world, onDone: onComplete, onRobotScore, input };
+  const deckProps = { world, onDone: onComplete, onRobotScore, input, onMicStatus };
 
   const body = (() => {
     if (level.key === "listen") return <ListenGame world={world} onDone={onComplete} />;
@@ -688,6 +749,7 @@ function Play({ world, li, mode, checking, micDenied, onEnableMic, onExit, onCom
       <TopBar
         onBack={() => {
           hush();
+          onMicStatus("idle");
           onExit();
         }}
         title={`${level.emoji} ${level.name}`}
@@ -1102,6 +1164,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [caps, setCaps] = useState(null); // null = untested, else {mic, api}
   const [checking, setChecking] = useState(false);
+  const [micStatus, setMicStatus] = useState("idle");
 
   /* persist */
   useEffect(() => {
@@ -1122,6 +1185,8 @@ export default function App() {
     : caps.api
     ? "azure"
     : "record";
+
+  const showMicBar = mode === "azure" || mode === "record";
 
   const requestCaps = async () => {
     if (checking) return;
@@ -1193,7 +1258,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen font-body" style={{ background: PAPER }}>
-      <div className="max-w-md mx-auto px-4 py-6 pb-16">
+      <div className={`max-w-md mx-auto px-4 py-6 ${showMicBar ? "pb-28" : "pb-16"}`}>
         {view.name === "home" ? (
           <Home progress={progress} go={go} />
         ) : view.name === "world" ? (
@@ -1209,6 +1274,7 @@ export default function App() {
             onExit={() => go({ name: "world", w: view.w })}
             onComplete={(payload) => complete(view.w, view.li, payload)}
             onRobotScore={addRobotScore(view.w)}
+            onMicStatus={setMicStatus}
           />
         ) : view.name === "stars" ? (
           <Stars progress={progress} go={go} onReset={reset} />
@@ -1223,6 +1289,8 @@ export default function App() {
           />
         )}
       </div>
+
+      {showMicBar && <MicStatusBar status={micStatus} />}
 
       {result && (
         <Celebrate
@@ -1246,3 +1314,4 @@ export default function App() {
     </div>
   );
 }
+
