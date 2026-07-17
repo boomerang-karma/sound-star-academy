@@ -4,6 +4,7 @@ import {
   speak,
   hush,
   canSpeak,
+  waitForQuiet,
   detectCapabilities,
   createAssessmentSession,
   recordClip,
@@ -326,6 +327,28 @@ const POS_CHIP = {
 const starsFor = (t) => (t >= 80 ? 3 : t >= 60 ? 2 : 1);
 const starRow = (n) => "⭐".repeat(n);
 
+/** Live volume bars — kids (and grown-ups) can see the mic is alive. */
+function LevelMeter({ level = 0, speaking = false, noisy = false }) {
+  const bars = 7;
+  const lit = Math.round(level * bars);
+  const color = noisy ? "#FF8A3D" : speaking ? "#37C978" : "#9CA3AF";
+  return (
+    <div className="flex items-end justify-center gap-1 h-10 my-2" aria-hidden>
+      {[...Array(bars)].map((_, i) => (
+        <span
+          key={i}
+          className="w-2.5 rounded-sm border-2 transition-all duration-75"
+          style={{
+            borderColor: INK,
+            height: `${10 + i * 4}px`,
+            background: i < lit ? color : "#00000012",
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
 function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus = () => {} }) {
   const [i, setI] = useState(0);
   const [phase, setPhase] = useState("say"); // say|rate|listening|verdict|recording|compare
@@ -336,9 +359,11 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
   const [burst, setBurst] = useState(0);
   const [ready, setReady] = useState(false);
   const [hearing, setHearing] = useState(false);
+  const [levelSnap, setLevelSnap] = useState(null);
   const [sessionDead, setSessionDead] = useState(false);
   const recRef = useRef(null);
   const sessRef = useRef(null);
+  const levelRef = useRef(null);
 
   const item = items[i];
   const ttsRate = kind === "words" ? 0.78 : 0.72;
@@ -348,6 +373,8 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
     setVerdict(null);
     setTries(0);
     setClip(null);
+    setLevelSnap(null);
+    setHearing(false);
     const t = setTimeout(() => speak(item.text, ttsRate), 400);
     return () => clearTimeout(t);
   }, [i]);
@@ -370,7 +397,8 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
     onMicStatus("connecting");
 
     createAssessmentSession(world.id, {
-      endSilenceMs: kind === "words" ? 1100 : 1900,
+      endSilenceMs: kind === "words" ? 1000 : 1700,
+      maxListenMs: kind === "words" ? 8000 : 14000,
       onReady: () => {
         if (dead) return;
         setReady(true);
@@ -378,6 +406,12 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
       },
       onHearing: () => {
         if (!dead) setHearing(true);
+      },
+      onLevel: (snap) => {
+        if (dead) return;
+        levelRef.current = snap;
+        setLevelSnap(snap);
+        if (snap.speakingNow || snap.speechDetected) setHearing(true);
       },
     })
       .then((sess) => {
@@ -413,6 +447,8 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
 
   const retrySay = () => {
     setPhase("say");
+    setLevelSnap(null);
+    setHearing(false);
     speak(item.text, 0.68);
   };
 
@@ -422,16 +458,31 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
     if (!sess) return; // not armed yet — button is disabled anyway
     hush();
     setHearing(false);
+    setLevelSnap(null);
     setPhase("listening");
     onMicStatus("listening");
+    // Don't score the robot voice or button-click thump.
+    await waitForQuiet(700);
     let v;
     try {
-      const res = await sess.assess(item.text);
+      const res = await sess.assess(item.text, {
+        onLevel: (snap) => {
+          levelRef.current = snap;
+          setLevelSnap(snap);
+          if (snap.speakingNow || snap.speechDetected) setHearing(true);
+        },
+      });
       if (res.status === "ok") {
         v = { kind: "ok", ...res, stars: starsFor(res.target) };
         onRobotScore(res.target);
+      } else if (res.status === "too_quiet") {
+        v = { kind: "too_quiet", heard: res.heard };
+      } else if (res.status === "noisy") {
+        v = { kind: "noisy", heard: res.heard };
+      } else if (res.status === "timeout") {
+        v = { kind: "timeout" };
       } else {
-        v = { kind: "nomatch" };
+        v = { kind: "nomatch", reason: res.reason, heard: res.heard };
       }
     } catch (e) {
       v = { kind: "error" };
@@ -445,11 +496,17 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
   /* ---- record & compare ---- */
   const startRecord = async () => {
     hush();
+    await waitForQuiet(500);
     setPhase("recording");
+    setLevelSnap(null);
     onMicStatus("recording");
     try {
       const ms = kind === "words" ? 3500 : 6000;
-      const r = await recordClip(ms, (s) => setCountdown(s));
+      const r = await recordClip(
+        ms,
+        (s) => setCountdown(s),
+        (snap) => setLevelSnap(snap)
+      );
       recRef.current = r;
       const blob = await r.done;
       recRef.current = null;
@@ -547,12 +604,27 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
           <div className="text-6xl pulse inline-block">{hearing ? "🗣️" : "🎤"}</div>
           <div
             className="font-display font-extrabold text-xl mt-2"
-            style={{ color: "#1B9E55" }}
+            style={{
+              color: levelSnap?.noisyRoom ? "#C45C12" : hearing ? "#1B9E55" : "#1B9E55",
+            }}
           >
-            {hearing ? "I hear you!" : "🟢 Say it now!"}
+            {levelSnap?.noisyRoom && !hearing
+              ? "Lots of room noise…"
+              : hearing
+              ? "I hear you!"
+              : "🟢 Say it now!"}
           </div>
+          <LevelMeter
+            level={levelSnap?.level || 0}
+            speaking={!!(levelSnap?.speakingNow || hearing)}
+            noisy={!!levelSnap?.noisyRoom}
+          />
           <div className="font-bold text-base" style={{ color: INK, opacity: 0.7 }}>
-            {hearing ? "Keep going…" : "Take your time — the robot is listening."}
+            {hearing
+              ? "Keep going…"
+              : levelSnap?.tooQuietSoFar
+              ? "A bit closer / a bit louder!"
+              : "Take your time — bars jump when you speak."}
           </div>
         </Pane>
       )}
@@ -619,7 +691,76 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
             <>
               <div className="text-5xl mb-2">🤫</div>
               <div className="font-display font-extrabold text-lg mb-3" style={{ color: INK }}>
-                I couldn't hear you — get closer and try again!
+                {verdict.reason === "unrelated"
+                  ? "I heard something else — try just the word!"
+                  : "I couldn't catch that — get closer and try again!"}
+              </div>
+              {verdict.heard && (
+                <div className="font-bold text-xs mb-3" style={{ color: INK, opacity: 0.55 }}>
+                  🤖 heard: “{verdict.heard}”
+                </div>
+              )}
+              <div className="grid grid-cols-1 gap-3">
+                <Btn color={world.color} className="py-4 text-lg" onClick={startAzure}>
+                  🎤 Try again
+                </Btn>
+                <Btn className="py-3 text-base" onClick={advance}>
+                  Next ➜
+                </Btn>
+              </div>
+            </>
+          )}
+
+          {verdict.kind === "too_quiet" && (
+            <>
+              <div className="text-5xl mb-2">🔉</div>
+              <div className="font-display font-extrabold text-lg mb-2" style={{ color: INK }}>
+                Too quiet — I barely heard a sound!
+              </div>
+              <div className="font-bold text-sm mb-3" style={{ color: INK, opacity: 0.75 }}>
+                Hold the phone closer and use a big voice. Watch the green bars jump.
+              </div>
+              <div className="grid grid-cols-1 gap-3">
+                <Btn color={world.color} className="py-4 text-lg" onClick={startAzure}>
+                  🎤 Try louder
+                </Btn>
+                <Btn className="py-3 text-base" onClick={advance}>
+                  Next ➜
+                </Btn>
+              </div>
+            </>
+          )}
+
+          {verdict.kind === "noisy" && (
+            <>
+              <div className="text-5xl mb-2">🌪️</div>
+              <div className="font-display font-extrabold text-lg mb-2" style={{ color: INK }}>
+                Too much noise around you!
+              </div>
+              <div className="font-bold text-sm mb-3" style={{ color: INK, opacity: 0.75 }}>
+                Pause the TV / move somewhere quieter, then try again.
+              </div>
+              {verdict.heard && (
+                <div className="font-bold text-xs mb-3" style={{ color: INK, opacity: 0.55 }}>
+                  🤖 picked up: “{verdict.heard}”
+                </div>
+              )}
+              <div className="grid grid-cols-1 gap-3">
+                <Btn color={world.color} className="py-4 text-lg" onClick={startAzure}>
+                  🎤 Try in a quieter spot
+                </Btn>
+                <Btn className="py-3 text-base" onClick={advance}>
+                  Next ➜
+                </Btn>
+              </div>
+            </>
+          )}
+
+          {verdict.kind === "timeout" && (
+            <>
+              <div className="text-5xl mb-2">⏱️</div>
+              <div className="font-display font-extrabold text-lg mb-3" style={{ color: INK }}>
+                I waited a long time — say it right after you tap!
               </div>
               <div className="grid grid-cols-1 gap-3">
                 <Btn color={world.color} className="py-4 text-lg" onClick={startAzure}>
@@ -658,6 +799,11 @@ function SayDeck({ items, world, kind, input, onDone, onRobotScore, onMicStatus 
           <div className="font-display font-extrabold text-lg mt-2" style={{ color: INK }}>
             Speak now! {countdown !== null ? `(${countdown})` : ""}
           </div>
+          <LevelMeter
+            level={levelSnap?.level || 0}
+            speaking={!!levelSnap?.speakingNow}
+            noisy={!!levelSnap?.noisyRoom}
+          />
           <Btn
             className="px-6 py-3 text-base mt-3"
             onClick={() => recRef.current && recRef.current.stop()}
